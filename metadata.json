@@ -1,0 +1,5 @@
+{
+  "name": "Pro Tennis Scoreboard",
+  "description": "A professional-grade broadcast-style tennis scoreboard with automatic scoring logic, keyboard shortcuts, and match history.",
+  "requestFramePermissions": []
+}
