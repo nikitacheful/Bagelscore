@@ -37,7 +37,6 @@ const App: React.FC = () => {
   const [isObsView, setIsObsView] = useState(false);
   const [copied, setCopied] = useState(false);
   
-  // Используем Ref для доступа к актуальному состоянию внутри слушателя событий без переподписки
   const matchRef = useRef<MatchState>(match);
   useEffect(() => {
     matchRef.current = match;
@@ -46,31 +45,27 @@ const App: React.FC = () => {
   const bc = useRef<BroadcastChannel | null>(null);
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const view = params.get('view');
-    const isObs = view === 'obs';
+    // Определяем, является ли страница "чистым" табло для OBS через путь /obs
+    const isObs = window.location.pathname.endsWith('/obs');
     setIsObsView(isObs);
 
     bc.current = new BroadcastChannel(CHANNEL_NAME);
     
     bc.current.onmessage = (event) => {
       const { type, payload } = event.data;
-      
       if (type === 'UPDATE_STATE') {
         setMatch(payload);
       } else if (type === 'REQUEST_STATE' && !isObs) {
-        // Только вкладка управления отвечает на запрос состояния
         bc.current?.postMessage({ type: 'UPDATE_STATE', payload: matchRef.current });
       }
     };
 
-    // Если это OBS, запрашиваем состояние у вкладки управления при загрузке
     if (isObs) {
       bc.current.postMessage({ type: 'REQUEST_STATE' });
     }
 
     return () => bc.current?.close();
-  }, []); // Пустой массив зависимостей - подписываемся один раз
+  }, []);
 
   const broadcastState = (newState: MatchState) => {
     setMatch(newState);
@@ -137,9 +132,9 @@ const App: React.FC = () => {
   };
 
   const handleCopyObsLink = () => {
-    // Формируем чистую ссылку без дублирования слешей
-    const url = new URL(window.location.href);
-    url.searchParams.set('view', 'obs');
+    // Формируем чистую ссылку на "страницу" /obs
+    const url = new URL(window.location.origin);
+    url.pathname = '/obs';
     const obsUrl = url.toString();
     
     navigator.clipboard.writeText(obsUrl).then(() => {
@@ -166,7 +161,7 @@ const App: React.FC = () => {
 
   if (isObsView) {
     return (
-      <div className="w-screen h-screen flex items-start justify-start p-6 bg-transparent">
+      <div className="w-screen h-screen flex items-start justify-start p-6 bg-transparent overflow-hidden">
         {match.status !== 'setup' && <Scoreboard state={match} />}
       </div>
     );
