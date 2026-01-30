@@ -5,31 +5,44 @@ import Controls from './components/Controls';
 import { updateMatchScore } from './utils/tennisLogic';
 
 const CHANNEL_NAME = 'bagel_tennis_sync';
+const STORAGE_KEY = 'bagel_match_state';
 
-const getInitialMatchState = (): MatchState => ({
-  matchTitle: 'ПРЯМОЙ ЭФИР',
-  status: 'setup',
-  settings: {
+const getInitialMatchState = (): MatchState => {
+  const saved = localStorage.getItem(STORAGE_KEY);
+  if (saved) {
+    try {
+      const parsed = JSON.parse(saved);
+      // Убеждаемся, что загруженные данные имеют правильную структуру
+      if (parsed && parsed.status) return parsed;
+    } catch (e) {
+      console.error("Error parsing saved state", e);
+    }
+  }
+  return {
     matchTitle: 'ПРЯМОЙ ЭФИР',
-    bestOf: 3,
-    setFormat: 'standard',
-    decidingPoint: false,
-    thirdSetFormat: 'full',
-    superTBPoints: 10,
-    player1Name: '',
-    player1Seed: '',
-    player1Icon: '',
-    player2Name: '',
-    player2Seed: '',
-    player2Icon: '',
-  },
-  players: [
-    { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: true, matchesWon: 0 },
-    { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: false, matchesWon: 0 }
-  ],
-  currentSetIndex: 0,
-  isTiebreak: false
-});
+    status: 'setup',
+    settings: {
+      matchTitle: 'ПРЯМОЙ ЭФИР',
+      bestOf: 3,
+      setFormat: 'standard',
+      decidingPoint: false,
+      thirdSetFormat: 'full',
+      superTBPoints: 10,
+      player1Name: '',
+      player1Seed: '',
+      player1Icon: '',
+      player2Name: '',
+      player2Seed: '',
+      player2Icon: '',
+    },
+    players: [
+      { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: true, matchesWon: 0 },
+      { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: false, matchesWon: 0 }
+    ],
+    currentSetIndex: 0,
+    isTiebreak: false
+  };
+};
 
 const App: React.FC = () => {
   const [match, setMatch] = useState<MatchState>(getInitialMatchState());
@@ -38,15 +51,23 @@ const App: React.FC = () => {
   const [copied, setCopied] = useState(false);
   
   const matchRef = useRef<MatchState>(match);
-  useEffect(() => {
-    matchRef.current = match;
-  }, [match]);
-
   const bc = useRef<BroadcastChannel | null>(null);
 
   useEffect(() => {
-    // Определяем, является ли страница "чистым" табло для OBS через путь /obs
-    const isObs = window.location.pathname.endsWith('/obs');
+    matchRef.current = match;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(match));
+  }, [match]);
+
+  const broadcastState = useCallback((newState: MatchState) => {
+    setMatch(newState);
+    if (bc.current) {
+      bc.current.postMessage({ type: 'UPDATE_STATE', payload: newState });
+    }
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const isObs = window.location.pathname.endsWith('/obs') || params.get('view') === 'obs';
     setIsObsView(isObs);
 
     bc.current = new BroadcastChannel(CHANNEL_NAME);
@@ -60,24 +81,34 @@ const App: React.FC = () => {
       }
     };
 
+    const handleStorageChange = (e: StorageEvent) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        try {
+          const newState = JSON.parse(e.newValue);
+          setMatch(newState);
+        } catch (err) {
+          console.error("Storage sync error", err);
+        }
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+
     if (isObs) {
       bc.current.postMessage({ type: 'REQUEST_STATE' });
     }
 
-    return () => bc.current?.close();
+    return () => {
+      bc.current?.close();
+      window.removeEventListener('storage', handleStorageChange);
+    };
   }, []);
 
-  const broadcastState = (newState: MatchState) => {
-    setMatch(newState);
-    bc.current?.postMessage({ type: 'UPDATE_STATE', payload: newState });
-  };
-
   const handlePoint = useCallback((winnerIndex: number) => {
-    if (match.status === 'finished') return;
+    if (match.status === 'finished' || match.status === 'setup') return;
     setHistory(prev => [...prev, match]);
     const newState = updateMatchScore(match, winnerIndex);
     broadcastState(newState);
-  }, [match]);
+  }, [match, broadcastState]);
 
   const handleToggleServer = useCallback(() => {
     if (match.status !== 'playing') return;
@@ -86,58 +117,85 @@ const App: React.FC = () => {
     newPlayers[0] = { ...newPlayers[0], isServing: !newPlayers[0].isServing };
     newPlayers[1] = { ...newPlayers[1], isServing: !newPlayers[1].isServing };
     broadcastState({ ...match, players: newPlayers });
-  }, [match]);
+  }, [match, broadcastState]);
 
   const handleUndo = useCallback(() => {
     if (history.length === 0) return;
     const lastState = history[history.length - 1];
     setHistory(prev => prev.slice(0, -1));
     broadcastState(lastState);
-  }, [history]);
+  }, [history, broadcastState]);
 
   const handleReset = useCallback(() => {
-    const fresh = getInitialMatchState();
-    setHistory([]);
-    broadcastState(fresh);
-  }, []);
+    if (window.confirm("Вы уверены, что хотите сбросить матч и вернуться к настройкам?")) {
+      const fresh: MatchState = {
+        matchTitle: 'ПРЯМОЙ ЭФИР',
+        status: 'setup',
+        settings: {
+          matchTitle: 'ПРЯМОЙ ЭФИР',
+          bestOf: 3,
+          setFormat: 'standard',
+          decidingPoint: false,
+          thirdSetFormat: 'full',
+          superTBPoints: 10,
+          player1Name: '',
+          player1Seed: '',
+          player1Icon: '',
+          player2Name: '',
+          player2Seed: '',
+          player2Icon: '',
+        },
+        players: [
+          { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: true, matchesWon: 0 },
+          { name: '', seed: '', icon: '', sets: [0, 0, 0, 0, 0], tiebreakScores: [0, 0, 0, 0, 0], currentPoints: '0', isServing: false, matchesWon: 0 }
+        ],
+        currentSetIndex: 0,
+        isTiebreak: false
+      };
+      setHistory([]);
+      localStorage.removeItem(STORAGE_KEY);
+      broadcastState(fresh);
+    }
+  }, [broadcastState]);
 
   const handleStart = (settings: MatchSettings) => {
-    const fresh = getInitialMatchState();
     const startedState: MatchState = {
-      ...fresh,
       matchTitle: settings.matchTitle || 'ПРЯМОЙ ЭФИР',
       status: 'playing',
       settings,
       players: [
         { 
-          ...fresh.players[0], 
-          name: settings.player1Name, 
+          name: settings.player1Name || 'ИГРОК 1', 
           seed: settings.player1Seed, 
           icon: settings.player1Icon,
           sets: new Array(settings.bestOf).fill(0),
           tiebreakScores: new Array(settings.bestOf).fill(0),
+          currentPoints: '0',
+          isServing: true,
+          matchesWon: 0
         },
         { 
-          ...fresh.players[1], 
-          name: settings.player2Name, 
+          name: settings.player2Name || 'ИГРОК 2', 
           seed: settings.player2Seed, 
           icon: settings.player2Icon,
           sets: new Array(settings.bestOf).fill(0),
           tiebreakScores: new Array(settings.bestOf).fill(0),
+          currentPoints: '0',
+          isServing: false,
+          matchesWon: 0
         }
-      ]
+      ],
+      currentSetIndex: 0,
+      isTiebreak: false
     };
     setHistory([]);
     broadcastState(startedState);
   };
 
   const handleCopyObsLink = () => {
-    // Формируем чистую ссылку на "страницу" /obs
     const url = new URL(window.location.origin);
     url.pathname = '/obs';
-    const obsUrl = url.toString();
-    
-    navigator.clipboard.writeText(obsUrl).then(() => {
+    navigator.clipboard.writeText(url.toString()).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
@@ -146,7 +204,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (isObsView) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement) return;
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       switch(e.key.toLowerCase()) {
         case 'r': case 'к': handleReset(); break;
         case '1': if(match.status === 'playing') handlePoint(0); break;
@@ -181,26 +239,11 @@ const App: React.FC = () => {
             onClick={handleCopyObsLink}
             className={`mt-6 flex items-center gap-2 px-4 py-2 rounded-full border transition-all active:scale-95 text-[10px] font-black uppercase tracking-widest ${
               copied 
-              ? 'bg-[#CCFF00] border-[#CCFF00] text-black' 
-              : 'bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20'
+              ? 'bg-[#CCFF00] border-[#CCFF00] text-black shadow-[0_0_15px_rgba(204,255,0,0.3)]' 
+              : 'bg-blue-500/10 border-blue-500/30 text-blue-400 hover:bg-blue-500/20 shadow-lg'
             }`}
           >
-            {copied ? (
-              <>
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                  <path fillRule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clipRule="evenodd" />
-                </svg>
-                Скопировано!
-              </>
-            ) : (
-              <>
-                <svg xmlns="http://www.w3.org/2000/svg" className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
-                  <path d="M8 3a1 1 0 011-1h2a1 1 0 110 2H9a1 1 0 01-1-1z" />
-                  <path d="M6 3a2 2 0 00-2 2v11a2 2 0 002 2h8a2 2 0 002-2V5a2 2 0 00-2-2 3 3 0 01-3 3H9a3 3 0 01-3-3z" />
-                </svg>
-                Копировать ссылку для OBS
-              </>
-            )}
+            {copied ? '✓ Скопировано' : '🔗 Копировать ссылку для OBS'}
           </button>
         )}
       </header>
@@ -220,7 +263,6 @@ const App: React.FC = () => {
           />
         </div>
       </div>
-
       <footer className="mt-auto py-8"></footer>
     </div>
   );
