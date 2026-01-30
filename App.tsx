@@ -4,8 +4,10 @@ import Scoreboard from './components/Scoreboard';
 import Controls from './components/Controls';
 import { updateMatchScore } from './utils/tennisLogic';
 
-const CHANNEL_NAME = 'bagel_tennis_sync_v2';
-const STORAGE_KEY = 'bagel_match_state_v2';
+declare var Peer: any; // PeerJS из index.html
+
+const STORAGE_KEY = 'bagel_match_state_v3';
+const MATCH_ID_KEY = 'bagel_match_id_v3';
 
 const createEmptyState = (): MatchState => ({
   matchTitle: 'ПРЯМОЙ ЭФИР',
@@ -32,233 +34,205 @@ const createEmptyState = (): MatchState => ({
   isTiebreak: false
 });
 
-const getInitialMatchState = (): MatchState => {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (saved) {
-    try {
-      const parsed = JSON.parse(saved);
-      if (parsed && parsed.status) return parsed;
-    } catch (e) {
-      console.error("Parse error", e);
-    }
-  }
-  return createEmptyState();
-};
+const generateMatchId = () => `bagel-${Math.floor(Math.random() * 900) + 100}-${Math.random().toString(36).substring(7)}`;
 
 const App: React.FC = () => {
-  const [match, setMatch] = useState<MatchState>(getInitialMatchState());
+  const [match, setMatch] = useState<MatchState>(createEmptyState());
   const [history, setHistory] = useState<MatchState[]>([]);
+  const [matchId, setMatchId] = useState<string>(localStorage.getItem(MATCH_ID_KEY) || generateMatchId());
   const [isObsView, setIsObsView] = useState(false);
+  const [isLive, setIsLive] = useState(false);
   const [copied, setCopied] = useState(false);
   
+  const peerRef = useRef<any>(null);
+  const connectionRef = useRef<any>(null);
   const matchRef = useRef<MatchState>(match);
-  const bc = useRef<BroadcastChannel | null>(null);
 
-  // Обновляем реф и локальное хранилище при каждом изменении состояния
   useEffect(() => {
     matchRef.current = match;
     localStorage.setItem(STORAGE_KEY, JSON.stringify(match));
-  }, [match]);
-
-  // Основная функция рассылки состояния
-  const broadcastState = useCallback((newState: MatchState) => {
-    setMatch(newState);
-    if (bc.current) {
-      bc.current.postMessage({ type: 'UPDATE_STATE', payload: newState });
+    // Если мы в режиме управления и есть соединение - шлем данные
+    if (!isObsView && connectionRef.current) {
+      connectionRef.current.send(match);
     }
-  }, []);
+  }, [match, isObsView]);
+
+  useEffect(() => {
+    localStorage.setItem(MATCH_ID_KEY, matchId);
+  }, [matchId]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const isObs = params.get('view') === 'obs';
+    const view = params.get('view');
+    const urlMatchId = params.get('matchId');
+    const isObs = view === 'obs';
     setIsObsView(isObs);
 
-    bc.current = new BroadcastChannel(CHANNEL_NAME);
-    
-    bc.current.onmessage = (event) => {
-      const { type, payload } = event.data;
-      if (type === 'UPDATE_STATE') {
-        setMatch(payload);
-      } else if (type === 'REQUEST_STATE' && !isObs) {
-        // Ответ на запрос состояния от новой вкладки OBS
-        bc.current?.postMessage({ type: 'UPDATE_STATE', payload: matchRef.current });
-      }
-    };
+    const targetMatchId = urlMatchId || matchId;
+    if (urlMatchId) setMatchId(urlMatchId);
 
-    // Слушатель для синхронизации через хранилище (доп. канал)
-    const onStorage = (e: StorageEvent) => {
-      if (e.key === STORAGE_KEY && e.newValue) {
-        setMatch(JSON.parse(e.newValue));
-      }
-    };
-    window.addEventListener('storage', onStorage);
+    // Инициализация PeerJS
+    peerRef.current = new Peer(isObs ? undefined : targetMatchId);
 
-    // Если это OBS, при загрузке запрашиваем актуальное состояние
-    if (isObs) {
-      bc.current.postMessage({ type: 'REQUEST_STATE' });
+    peerRef.current.on('open', (id: string) => {
+      console.log('Peer connected with ID:', id);
+      if (isObs) {
+        // Если это OBS - подключаемся к основной панели
+        const conn = peerRef.current.connect(targetMatchId);
+        setupConnection(conn);
+      }
+    });
+
+    peerRef.current.on('connection', (conn: any) => {
+      // Это срабатывает на стороне управления, когда подключается OBS
+      setupConnection(conn);
+    });
+
+    peerRef.current.on('error', (err: any) => {
+      console.error('Peer error:', err);
+      if (err.type === 'unavailable-id' && !isObs) {
+        // Если ID занят (например, вкладка уже открыта), генерируем новый
+        const newId = generateMatchId();
+        setMatchId(newId);
+        window.location.reload();
+      }
+    });
+
+    function setupConnection(conn: any) {
+      connectionRef.current = conn;
+      
+      conn.on('open', () => {
+        setIsLive(true);
+        // Шлем текущее состояние сразу после коннекта
+        if (!isObs) conn.send(matchRef.current);
+      });
+
+      conn.on('data', (data: any) => {
+        if (isObs) setMatch(data);
+      });
+
+      conn.on('close', () => {
+        setIsLive(false);
+        // Авто-переподключение для OBS
+        if (isObs) {
+          setTimeout(() => {
+            const newConn = peerRef.current.connect(targetMatchId);
+            setupConnection(newConn);
+          }, 3000);
+        }
+      });
     }
 
     return () => {
-      bc.current?.close();
-      window.removeEventListener('storage', onStorage);
+      if (peerRef.current) peerRef.current.destroy();
     };
   }, []);
 
-  // "Пульсация" (Heartbeat) - Каждые 2 секунды шлем состояние, чтобы OBS не терял связь
-  useEffect(() => {
-    if (isObsView) return; // Пульсирует только панель управления
-    
-    const interval = setInterval(() => {
-      if (matchRef.current.status !== 'setup') {
-        bc.current?.postMessage({ type: 'UPDATE_STATE', payload: matchRef.current });
-      }
-    }, 2000);
+  const broadcastState = useCallback((newState: MatchState) => {
+    setMatch(newState);
+  }, []);
 
-    return () => clearInterval(interval);
-  }, [isObsView]);
-
-  const handlePoint = useCallback((winnerIndex: number) => {
-    if (match.status !== 'playing') return;
+  const handlePoint = (idx: number) => {
     setHistory(prev => [...prev, match]);
-    const newState = updateMatchScore(match, winnerIndex);
-    broadcastState(newState);
-  }, [match, broadcastState]);
+    broadcastState(updateMatchScore(match, idx));
+  };
 
-  const handleToggleServer = useCallback(() => {
-    if (match.status !== 'playing') return;
+  const handleToggleServer = () => {
     setHistory(prev => [...prev, match]);
     const newPlayers = [...match.players] as [PlayerState, PlayerState];
     newPlayers[0] = { ...newPlayers[0], isServing: !newPlayers[0].isServing };
     newPlayers[1] = { ...newPlayers[1], isServing: !newPlayers[1].isServing };
     broadcastState({ ...match, players: newPlayers });
-  }, [match, broadcastState]);
+  };
 
-  const handleUndo = useCallback(() => {
+  const handleUndo = () => {
     if (history.length === 0) return;
-    const lastState = history[history.length - 1];
+    const last = history[history.length - 1];
     setHistory(prev => prev.slice(0, -1));
-    broadcastState(lastState);
-  }, [history, broadcastState]);
+    broadcastState(last);
+  };
 
-  const handleReset = useCallback(() => {
-    if (window.confirm("Сбросить текущий матч и вернуться к настройкам?")) {
+  const handleReset = () => {
+    if (window.confirm("Сбросить матч?")) {
       const fresh = createEmptyState();
       setHistory([]);
-      localStorage.removeItem(STORAGE_KEY);
       broadcastState(fresh);
-      // Принудительно уведомляем всех
-      bc.current?.postMessage({ type: 'UPDATE_STATE', payload: fresh });
     }
-  }, [broadcastState]);
+  };
 
   const handleStart = (settings: MatchSettings) => {
-    const startedState: MatchState = {
+    const started: MatchState = {
+      ...createEmptyState(),
       matchTitle: settings.matchTitle || 'ПРЯМОЙ ЭФИР',
       status: 'playing',
       settings,
       players: [
-        { 
-          ...createEmptyState().players[0],
-          name: settings.player1Name || 'ИГРОК 1', 
-          seed: settings.player1Seed, 
-          icon: settings.player1Icon,
-          sets: new Array(settings.bestOf).fill(0),
-          tiebreakScores: new Array(settings.bestOf).fill(0),
-          isServing: true
-        },
-        { 
-          ...createEmptyState().players[1],
-          name: settings.player2Name || 'ИГРОК 2', 
-          seed: settings.player2Seed, 
-          icon: settings.player2Icon,
-          sets: new Array(settings.bestOf).fill(0),
-          tiebreakScores: new Array(settings.bestOf).fill(0),
-          isServing: false
-        }
-      ],
-      currentSetIndex: 0,
-      isTiebreak: false
+        { ...createEmptyState().players[0], name: settings.player1Name || 'ИГРОК 1', seed: settings.player1Seed, icon: settings.player1Icon, sets: new Array(settings.bestOf).fill(0), tiebreakScores: new Array(settings.bestOf).fill(0) },
+        { ...createEmptyState().players[1], name: settings.player2Name || 'ИГРОК 2', seed: settings.player2Seed, icon: settings.player2Icon, sets: new Array(settings.bestOf).fill(0), tiebreakScores: new Array(settings.bestOf).fill(0) }
+      ]
     };
     setHistory([]);
-    broadcastState(startedState);
+    broadcastState(started);
   };
 
-  const handleCopyObsLink = () => {
-    const url = new URL(window.location.href);
-    url.search = '?view=obs'; // Используем query-параметр для максимальной совместимости
-    
+  const handleCopyLink = () => {
+    const url = new URL(window.location.origin);
+    url.search = `?view=obs&matchId=${matchId}`;
     navigator.clipboard.writeText(url.toString()).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     });
   };
 
-  useEffect(() => {
-    if (isObsView) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
-      const key = e.key.toLowerCase();
-      if (key === '1') handlePoint(0);
-      if (key === '2') handlePoint(1);
-      if (key === 's' || key === 'ы') handleToggleServer();
-      if (key === 'z' || key === 'я') handleUndo();
-      if (key === 'r' || key === 'к') handleReset();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [match.status, handlePoint, handleUndo, handleReset, handleToggleServer, isObsView]);
-
   if (isObsView) {
     return (
-      <div className="w-screen h-screen flex items-start justify-start p-10 bg-transparent overflow-hidden">
+      <div className="w-screen h-screen flex items-start justify-start p-10 bg-transparent">
         {match.status !== 'setup' && <Scoreboard state={match} />}
-        {/* Технический маркер для отладки в OBS (почти невидим) */}
-        <div className="fixed bottom-0 right-0 w-1 h-1 opacity-0 pointer-events-none">.</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center p-4 bg-[#0f172a]">
-      <header className="mb-10 text-center">
-        <h1 className="text-4xl font-black italic tracking-tighter text-white uppercase flex items-center justify-center gap-3">
-          <span className="bg-[#CCFF00] text-black px-2 py-0.5">Bagel</span> 
-          Tennis score
+    <div className="min-h-screen bg-[#0f172a] text-white flex flex-col items-center p-6">
+      <header className="mb-12 text-center relative">
+        <h1 className="text-5xl font-black italic tracking-tighter uppercase flex items-center justify-center gap-4">
+          <span className="bg-[#CCFF00] text-black px-3 py-1 rounded-sm">Bagel</span>
+          <span>Scoreboard</span>
         </h1>
         
         {match.status !== 'setup' && (
-          <div className="flex flex-col items-center gap-2 mt-6">
+          <div className="mt-8 flex flex-col items-center gap-4 animate-in fade-in slide-in-from-top-4 duration-700">
+            <div className={`flex items-center gap-2 px-3 py-1 rounded-full border text-[10px] font-black uppercase tracking-widest ${isLive ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-400'}`}>
+              <span className={`w-2 h-2 rounded-full ${isLive ? 'bg-[#CCFF00] pulse-green' : 'bg-red-500'}`}></span>
+              {isLive ? 'OBS Подключен' : 'Ожидание OBS...'}
+            </div>
+
             <button 
-              onClick={handleCopyObsLink}
-              className={`flex items-center gap-2 px-6 py-3 rounded-full border transition-all active:scale-95 text-xs font-black uppercase tracking-widest shadow-xl ${
-                copied 
-                ? 'bg-[#CCFF00] border-[#CCFF00] text-black' 
-                : 'bg-blue-600/20 border-blue-500/50 text-blue-400 hover:bg-blue-600/30'
+              onClick={handleCopyLink}
+              className={`group flex items-center gap-3 px-8 py-4 rounded-xl border transition-all active:scale-95 shadow-2xl ${
+                copied ? 'bg-[#CCFF00] border-[#CCFF00] text-black' : 'bg-blue-600 border-blue-500 hover:bg-blue-500 text-white'
               }`}
             >
-              {copied ? '✓ Ссылка скопирована' : '🔗 Ссылка для OBS (Browser Source)'}
+              <span className="font-black uppercase tracking-wider text-sm">
+                {copied ? '✓ Ссылка скопирована!' : '🔗 Скопировать ссылку для OBS'}
+              </span>
             </button>
-            <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Добавьте эту ссылку в OBS как "Браузер"</p>
+            <p className="text-[10px] text-slate-500 font-bold uppercase">ID матча: <span className="text-slate-400">{matchId}</span></p>
           </div>
         )}
       </header>
 
-      <div className="w-full max-w-5xl">
+      <main className="w-full max-w-5xl">
         {match.status !== 'setup' && <Scoreboard state={match} />}
-        
-        <div className="mt-8">
-          <Controls 
-            key={match.status}
-            state={match} 
-            onPoint={handlePoint} 
-            onUndo={handleUndo} 
-            onReset={handleReset}
-            onStart={handleStart}
-            onToggleServer={handleToggleServer}
-          />
-        </div>
-      </div>
-      <footer className="mt-auto py-8"></footer>
+        <Controls 
+          state={match}
+          onPoint={handlePoint}
+          onUndo={handleUndo}
+          onReset={handleReset}
+          onToggleServer={handleToggleServer}
+          onStart={handleStart}
+        />
+      </main>
     </div>
   );
 };
